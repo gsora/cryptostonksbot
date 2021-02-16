@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -21,7 +24,8 @@ import (
 	tb "gopkg.in/tucnak/telebot.v2"
 )
 
-var coinInfoFmt = `{{.Name}} ({{.Symbol}})
+var (
+	coinInfoFmt = `{{.Name}} ({{.Symbol}})
 
 Price: {{.Price}} ({{.PriceChangePercent}} {{.PriceEmoji}})
 Market cap: {{.MarketCap}}({{.MarketCapPercent}} {{.MarketCapEmoji}})
@@ -30,7 +34,7 @@ Last 24H high: {{.High24}}
 Last 24H low: {{.Low24}}
 `
 
-var (
+	ifIHadFmt          = "%s worth of %s in %d (priced at %s) are now worth %s 😱"
 	errInvalidCurrency = cgErr{Value: "invalid vs_currency"}
 
 	defaultSticker = &tb.Sticker{
@@ -139,6 +143,60 @@ func (cq *coinQuerier) lookupPrice(token, currency string) (types.CoinsMarketIte
 	return (*r)[0], nil
 }
 
+func (cq *coinQuerier) coinInfo(token string) (*types.CoinsID, error) {
+	id, found := cq.idMap[strings.ToLower(token)]
+	if !found {
+		return nil, fmt.Errorf("%s not supported", token)
+	}
+
+	return cq.gc.CoinsID(id, false, false, false, false, false, false)
+}
+
+func (cq *coinQuerier) ifIBought(token, currency string, year, month int, amount float64) (float64, float64, float64, error) {
+	currency = strings.ToLower(currency)
+
+	id, found := cq.idMap[strings.ToLower(token)]
+	if !found {
+		return 0, 0, 0, fmt.Errorf("%s not supported", token)
+	}
+
+	if month <= 0 || month > 12 {
+		month = int(time.Now().Month())
+	}
+
+	dateStr := fmt.Sprintf("15-%d-%d", month, year)
+
+	data, err := cq.gc.CoinsIDHistory(id, dateStr, false)
+	log.Println(dateStr)
+	if err != nil {
+		ret := fmt.Errorf("%s not supported", token)
+		if errors.Is(err, context.DeadlineExceeded) {
+			ret = fmt.Errorf("CoinGecko API connection failed 🤕")
+		}
+		log.Println("cannot query history data:", err)
+		return 0, 0, 0, ret
+	}
+
+	if data.MarketData == nil {
+		return 0, 0, 0, fmt.Errorf("No data available for year %d", year)
+	}
+
+	oldPrice, ok := data.MarketData.CurrentPrice[currency]
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("%s not supported", currency)
+	}
+
+	newData, err := cq.lookupPrice(token, currency)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	oldAmount := amount / oldPrice
+	newValue := oldAmount * newData.CurrentPrice
+
+	return oldAmount, newValue, oldPrice, nil
+}
+
 type templateData struct {
 	types.CoinsMarketItem
 	Price              string
@@ -193,7 +251,6 @@ func (t templateData) MarketCapEmoji() string {
 }
 
 func (cq *coinQuerier) queryMessage(ticker, fiatCurrency string) string {
-	ticker = strings.ToUpper(ticker)[1:]
 	p, err := cq.lookupPrice(ticker, fiatCurrency)
 	if err != nil {
 		return err.Error()
@@ -236,8 +293,9 @@ func main() {
 		Token: token,
 		Poller: &tb.LongPoller{
 			Timeout:        10 * time.Second,
-			AllowedUpdates: []string{"message"},
+			AllowedUpdates: []string{"message", "inline_query", "chosen_inline_result"},
 		},
+		Verbose: false,
 	})
 
 	if err != nil {
@@ -250,6 +308,8 @@ func main() {
 			return
 		}
 
+		ticker := strings.ToUpper(m.Text)[1:]
+
 		ticker, currency, err := queryData(m.Text)
 		if err != nil {
 			log.Println("cannot split query data:", err)
@@ -261,6 +321,96 @@ func main() {
 		if doIt() {
 			b.Send(m.Chat, defaultSticker)
 		}
+	})
+
+	b.Handle(tb.OnQuery, func(q *tb.Query) {
+		rawData := strings.Split(q.Text, " ")
+		if len(rawData) == 0 {
+			return
+		}
+
+		tokenID := strings.TrimSpace(rawData[0])
+		if len(tokenID) == 0 {
+			return
+		}
+
+		data, err := cq.coinInfo(tokenID)
+		if err != nil {
+			log.Println("cannot query inline token infos:", err)
+			return
+		}
+
+		result := &tb.ArticleResult{
+			Title:       fmt.Sprintf("%s (%s) informations", data.Name, tokenID),
+			Text:        cq.queryMessage(tokenID, defaultCurrency),
+			Description: fmt.Sprintf("Get current price, market cap infos about %s!", data.Name),
+			ThumbURL:    data.Image.Large,
+		}
+
+		result.SetResultID("0")
+
+		err = b.Answer(q, &tb.QueryResponse{
+			Results:   tb.Results{result},
+			CacheTime: 1, // a minute
+		})
+
+		if err != nil {
+			log.Println(err)
+		}
+	})
+
+	b.Handle("/whatif", func(m *tb.Message) {
+		f := strings.Fields(m.Text)
+		f = f[1:]
+
+		// /whatif 450usd btc
+		if len(f) < 3 {
+			b.Send(m.Chat, "Syntax: /whatif amount token year [month number]")
+			return
+		}
+
+		amount, err := strconv.ParseFloat(f[0], 64)
+		if err != nil {
+			b.Send(m.Chat, "Malformed amount")
+			return
+		}
+
+		token := f[1]
+
+		year, err := strconv.Atoi(f[2])
+		if err != nil {
+			b.Send(m.Chat, "Malformed year")
+			return
+		}
+
+		var month int
+		if len(f) == 4 {
+			mm, err := strconv.Atoi(f[2])
+			if err != nil {
+				b.Send(m.Chat, "Malformed month")
+			}
+
+			month = mm
+		}
+
+		_, new, oldPrice, err := cq.ifIBought(token, defaultCurrency, year, month, amount)
+		if err != nil {
+			b.Send(m.Chat, err.Error())
+			return
+		}
+
+		lc := accounting.LocaleInfo[strings.ToUpper(defaultCurrency)]
+		a := accounting.Accounting{Symbol: lc.ComSymbol, Precision: 2, Thousand: lc.ThouSep, Decimal: lc.DecSep}
+
+		ss := fmt.Sprintf(ifIHadFmt,
+			a.FormatMoneyInt(500),
+			strings.ToUpper(token),
+			year,
+			a.FormatMoneyFloat64(oldPrice),
+			a.FormatMoneyFloat64(new),
+		)
+		b.Send(m.Chat, ss)
+
 	})
 
 	b.Start()
