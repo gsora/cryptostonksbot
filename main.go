@@ -310,7 +310,7 @@ func main() {
 
 		ticker := strings.ToUpper(m.Text)[1:]
 
-		ticker, currency, err := queryData(m.Text)
+		ticker, currency, err := queryData(ticker)
 		if err != nil {
 			log.Println("cannot split query data:", err)
 			return
